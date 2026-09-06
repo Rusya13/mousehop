@@ -531,8 +531,12 @@ fn to_macos_media_key(key: u32) -> Option<u32> {
         scancode::Linux::KeyNextsong => Some(NX_KEYTYPE_NEXT),
         scancode::Linux::KeyPrevioussong => Some(NX_KEYTYPE_PREVIOUS),
         scancode::Linux::KeyRewind => Some(NX_KEYTYPE_REWIND),
-        scancode::Linux::KeyBrightnessup => Some(NX_KEYTYPE_BRIGHTNESS_UP),
-        scancode::Linux::KeyBrightnessdown => Some(NX_KEYTYPE_BRIGHTNESS_DOWN),
+        scancode::Linux::KeyBrightnessup | scancode::Linux::KeyF15 => {
+            Some(NX_KEYTYPE_BRIGHTNESS_UP)
+        }
+        scancode::Linux::KeyBrightnessdown | scancode::Linux::KeyF14 => {
+            Some(NX_KEYTYPE_BRIGHTNESS_DOWN)
+        }
         _ => None,
     }
 }
@@ -1363,6 +1367,14 @@ mod tests {
         );
         assert_eq!(
             to_macos_media_key(KeyBrightnessdown as u32),
+            Some(NX_KEYTYPE_BRIGHTNESS_DOWN)
+        );
+        assert_eq!(
+            to_macos_media_key(KeyF15 as u32),
+            Some(NX_KEYTYPE_BRIGHTNESS_UP)
+        );
+        assert_eq!(
+            to_macos_media_key(KeyF14 as u32),
             Some(NX_KEYTYPE_BRIGHTNESS_DOWN)
         );
 
