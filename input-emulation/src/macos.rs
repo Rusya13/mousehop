@@ -7,10 +7,11 @@ use core_foundation_sys::number::{CFNumberGetValue, CFNumberRef, kCFNumberSInt64
 use core_graphics::base::CGFloat;
 use core_graphics::display::{CGDisplay, CGPoint};
 use core_graphics::event::{
-    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
-    ScrollEventUnit,
+    CGEvent, CGEventField, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton,
+    EventField, ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+use foreign_types::ForeignType;
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
     display::DisplayLayout, scancode,
@@ -363,6 +364,27 @@ impl MacOSEmulation {
             key_event(self.event_source.clone(), key, 0, self.modifier_state.get());
         }
     }
+
+    async fn spawn_media_repeat_task(&mut self, media_key: u32) {
+        self.cancel_repeat_task().await;
+        // initial press (down event)
+        media_key_event(self.event_source.clone(), media_key, true);
+        let (repeat_delay, repeat_interval) = read_key_repeat_prefs();
+        let event_source = self.event_source.clone();
+        let repeat_task = tokio::task::spawn_local(async move {
+            tokio::time::sleep(repeat_delay).await;
+            loop {
+                media_key_event(event_source.clone(), media_key, true);
+                tokio::time::sleep(repeat_interval).await;
+            }
+        });
+        self.repeat_task = Some(repeat_task);
+    }
+
+    async fn release_media_key(&mut self, media_key: u32) {
+        self.cancel_repeat_task().await;
+        media_key_event(self.event_source.clone(), media_key, false);
+    }
 }
 
 fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError> {
@@ -474,6 +496,63 @@ fn modifier_event(event_source: CGEventSource, depressed: XMods) {
     event.set_flags(flags);
     event.post(CGEventTapLocation::HID);
     log::trace!("modifiers updated: {depressed:?}");
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventSetType(event: *mut c_void, eventType: u32);
+}
+
+/// macOS system-defined key types (from IOKit/hidsystem/ev_keymap.h)
+const NX_KEYTYPE_SOUND_UP: u32 = 0;
+const NX_KEYTYPE_SOUND_DOWN: u32 = 1;
+const NX_KEYTYPE_BRIGHTNESS_UP: u32 = 2;
+const NX_KEYTYPE_BRIGHTNESS_DOWN: u32 = 3;
+const NX_KEYTYPE_MUTE: u32 = 7;
+const NX_KEYTYPE_PLAY: u32 = 16;
+const NX_KEYTYPE_NEXT: u32 = 17;
+const NX_KEYTYPE_PREVIOUS: u32 = 18;
+const NX_KEYTYPE_REWIND: u32 = 20;
+
+const NX_SYSDEFINED: u32 = 14;
+const NX_SUBTYPE_AUX_CONTROL_BUTTONS: i64 = 8;
+const FIELD_EVENT_SUBTYPE: CGEventField = 0x53; // kCGEventSubtype (83)
+const FIELD_EVENT_DATA1: CGEventField = 0x95; // kCGEventData1 (149)
+const FIELD_EVENT_DATA2: CGEventField = 0x96; // kCGEventData2 (150)
+
+/// Map a Linux evdev key code to a macOS system-defined media key type.
+fn to_macos_media_key(key: u32) -> Option<u32> {
+    let linux_key = scancode::Linux::try_from(key).ok()?;
+    match linux_key {
+        scancode::Linux::KeyVolumeUp => Some(NX_KEYTYPE_SOUND_UP),
+        scancode::Linux::KeyVolumeDown => Some(NX_KEYTYPE_SOUND_DOWN),
+        scancode::Linux::KeyMute => Some(NX_KEYTYPE_MUTE),
+        scancode::Linux::KeyPlaypause => Some(NX_KEYTYPE_PLAY),
+        scancode::Linux::KeyNextsong => Some(NX_KEYTYPE_NEXT),
+        scancode::Linux::KeyPrevioussong => Some(NX_KEYTYPE_PREVIOUS),
+        scancode::Linux::KeyRewind => Some(NX_KEYTYPE_REWIND),
+        scancode::Linux::KeyBrightnessup => Some(NX_KEYTYPE_BRIGHTNESS_UP),
+        scancode::Linux::KeyBrightnessdown => Some(NX_KEYTYPE_BRIGHTNESS_DOWN),
+        _ => None,
+    }
+}
+
+fn media_key_event(event_source: CGEventSource, media_key: u32, is_down: bool) {
+    let Ok(event) = CGEvent::new(event_source) else {
+        log::warn!("unable to create CGEvent for media key");
+        return;
+    };
+    let flags: i64 = if is_down { 0xa00 } else { 0xb00 };
+    let data1: i64 = ((media_key as i64) << 16) | flags;
+
+    unsafe {
+        CGEventSetType(ForeignType::as_ptr(&event) as *mut c_void, NX_SYSDEFINED);
+    }
+    event.set_integer_value_field(FIELD_EVENT_SUBTYPE, NX_SUBTYPE_AUX_CONTROL_BUTTONS);
+    event.set_integer_value_field(FIELD_EVENT_DATA1, data1);
+    event.set_integer_value_field(FIELD_EVENT_DATA2, -1);
+    event.post(CGEventTapLocation::HID);
+    log::trace!("media key event: {media_key} (down: {is_down})");
 }
 
 /// Union of every active display's rectangle, as `(origin_x,
@@ -699,6 +778,17 @@ impl Emulation for MacOSEmulation {
                     key,
                     state,
                 } => {
+                    // System-defined media keys (Volume, Brightness, Play/Pause, Next/Prev)
+                    // require NX_SYSDEFINED auxiliary events rather than standard keyboard
+                    // scancodes, which modern macOS ignores for system audio and display adjustments.
+                    if let Some(media_key) = to_macos_media_key(key) {
+                        match state {
+                            1 => self.spawn_media_repeat_task(media_key).await,
+                            _ => self.release_media_key(media_key).await,
+                        }
+                        return Ok(());
+                    }
+
                     let code = match KeyMap::from_key_mapping(KeyMapping::Evdev(key as u16)) {
                         Ok(k) => k.mac as CGKeyCode,
                         Err(_) => {
@@ -1228,5 +1318,55 @@ mod tests {
         );
 
         assert_eq!(modifiers.get(), XMods::ShiftMask);
+    }
+
+    #[test]
+    fn media_keys_map_to_macos_system_defined_types() {
+        use super::{
+            NX_KEYTYPE_BRIGHTNESS_DOWN, NX_KEYTYPE_BRIGHTNESS_UP, NX_KEYTYPE_MUTE, NX_KEYTYPE_NEXT,
+            NX_KEYTYPE_PLAY, NX_KEYTYPE_PREVIOUS, NX_KEYTYPE_REWIND, NX_KEYTYPE_SOUND_DOWN,
+            NX_KEYTYPE_SOUND_UP, to_macos_media_key,
+        };
+        use input_event::scancode::Linux::{
+            KeyA, KeyBrightnessdown, KeyBrightnessup, KeyMute, KeyNextsong, KeyPlaypause,
+            KeyPrevioussong, KeyRewind, KeyVolumeDown, KeyVolumeUp,
+        };
+
+        assert_eq!(
+            to_macos_media_key(KeyVolumeUp as u32),
+            Some(NX_KEYTYPE_SOUND_UP)
+        );
+        assert_eq!(
+            to_macos_media_key(KeyVolumeDown as u32),
+            Some(NX_KEYTYPE_SOUND_DOWN)
+        );
+        assert_eq!(to_macos_media_key(KeyMute as u32), Some(NX_KEYTYPE_MUTE));
+        assert_eq!(
+            to_macos_media_key(KeyPlaypause as u32),
+            Some(NX_KEYTYPE_PLAY)
+        );
+        assert_eq!(
+            to_macos_media_key(KeyNextsong as u32),
+            Some(NX_KEYTYPE_NEXT)
+        );
+        assert_eq!(
+            to_macos_media_key(KeyPrevioussong as u32),
+            Some(NX_KEYTYPE_PREVIOUS)
+        );
+        assert_eq!(
+            to_macos_media_key(KeyRewind as u32),
+            Some(NX_KEYTYPE_REWIND)
+        );
+        assert_eq!(
+            to_macos_media_key(KeyBrightnessup as u32),
+            Some(NX_KEYTYPE_BRIGHTNESS_UP)
+        );
+        assert_eq!(
+            to_macos_media_key(KeyBrightnessdown as u32),
+            Some(NX_KEYTYPE_BRIGHTNESS_DOWN)
+        );
+
+        // Ordinary keys should not be treated as media keys
+        assert_eq!(to_macos_media_key(KeyA as u32), None);
     }
 }
