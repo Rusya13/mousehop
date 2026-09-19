@@ -151,6 +151,7 @@ struct State {
     pending_events: VecDeque<(Position, CaptureEvent)>,
     outputs: Vec<Output>,
     scroll_discrete_pending: bool,
+    last_release: Option<(Position, std::time::Instant)>,
 }
 
 struct Inner {
@@ -462,6 +463,7 @@ impl LayerShellInputCapture {
             pending_events: VecDeque::new(),
             outputs: vec![],
             scroll_discrete_pending: false,
+            last_release: None,
         };
 
         for global in state.global_list.contents().clone_list() {
@@ -673,6 +675,7 @@ impl State {
         // follows the mouse again, and nothing short of restarting the
         // daemon frees it.
         if let Some(window) = self.focused.as_ref() {
+            self.last_release = Some((window.pos, std::time::Instant::now()));
             // Restore normal keyboard focus. If the caller modeled a host
             // landing point, attach it to the still-live pointer lock before
             // committing and destroying the lock. Cursor position hints are
@@ -1056,6 +1059,12 @@ impl Dispatch<WlPointer, ()> for State {
                 else {
                     return;
                 };
+                if let Some((pos, instant)) = app.last_release {
+                    if pos == window.pos && instant.elapsed() < std::time::Duration::from_millis(300) {
+                        log::debug!("suppressing rapid re-entry on {pos} during release cooldown");
+                        return;
+                    }
+                }
                 app.focused = Some(window.clone());
                 let cursor = surface_to_screen(&window, surface_x, surface_y);
                 let layout = output_layout(&app.outputs);

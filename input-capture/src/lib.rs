@@ -450,7 +450,20 @@ impl InputCapture {
         // cursor visually was.
         let warp_target = self
             .capture_pos
-            .and_then(|pos| self.host_warp_target_on_release(pos));
+            .and_then(|pos| self.host_warp_target_on_release(pos))
+            .or_else(|| {
+                let pos = self.capture_pos?;
+                let cursor = self.pending_begin_cursor?;
+                let layout = self.capture.display_layout()?;
+                let nudged = match pos {
+                    Position::Left => (cursor.0.saturating_add(2), cursor.1),
+                    Position::Right => (cursor.0.saturating_sub(2), cursor.1),
+                    Position::Top => (cursor.0, cursor.1.saturating_add(2)),
+                    Position::Bottom => (cursor.0, cursor.1.saturating_sub(2)),
+                };
+                let (cx, cy) = layout.clamp_to_nearest_display((f64::from(nudged.0), f64::from(nudged.1)))?;
+                Some((cx as i32, cy as i32))
+            });
         log::info!(
             "[release-warp] capture_pos={:?} virtual_cursor={:?} peer_bounds={:?} display_bounds={:?} → warp_target={warp_target:?}",
             self.capture_pos,
@@ -897,7 +910,15 @@ impl InputCapture {
                 origin_y + host_h_i.saturating_sub(1),
             ),
         };
-        layout.project_point(display_edge(pos), rectangular_target)
+        let projected = layout.project_point(display_edge(pos), rectangular_target)?;
+        let nudged = match pos {
+            Position::Left => (projected.0.saturating_add(2), projected.1),
+            Position::Right => (projected.0.saturating_sub(2), projected.1),
+            Position::Top => (projected.0, projected.1.saturating_add(2)),
+            Position::Bottom => (projected.0, projected.1.saturating_sub(2)),
+        };
+        let (cx, cy) = layout.clamp_to_nearest_display((f64::from(nudged.0), f64::from(nudged.1)))?;
+        Some((cx as i32, cy as i32))
     }
 
     /// Update the wall-press accumulator from one event coming up

@@ -367,15 +367,28 @@ impl InputEmulation {
             .emulation
             .display_layout()
             .ok_or(EmulationError::DisplayTopologyUnavailable)?;
-        let Some(((global_x, global_y), (x, y))) =
+        let Some(((global_x, global_y), (_x, _y))) =
             edge_warp_projection(&layout, edge, cross_fraction)
         else {
             return Err(EmulationError::DisplayTopologyUnavailable);
         };
+        let bounds = layout.bounds().ok_or(EmulationError::DisplayTopologyUnavailable)?;
+        let origin = bounds.origin();
+        let (nudged_gx, nudged_gy) = match edge {
+            DisplayEdge::Left => (global_x.saturating_add(2), global_y),
+            DisplayEdge::Right => (global_x.saturating_sub(2), global_y),
+            DisplayEdge::Top => (global_x, global_y.saturating_add(2)),
+            DisplayEdge::Bottom => (global_x, global_y.saturating_sub(2)),
+        };
+        let (clamped_gx, clamped_gy) = layout
+            .clamp_to_nearest_display((f64::from(nudged_gx), f64::from(nudged_gy)))
+            .ok_or(EmulationError::DisplayTopologyUnavailable)?;
+        let final_x = (clamped_gx as i32) - origin.0;
+        let final_y = (clamped_gy as i32) - origin.1;
         log::info!(
-            "[cursor-pos] projected {edge:?} fraction={cross_fraction:.4} onto global=({global_x},{global_y}), union-relative=({x},{y})"
+            "[cursor-pos] projected {edge:?} fraction={cross_fraction:.4} onto global=({clamped_gx},{clamped_gy}), union-relative=({final_x},{final_y})"
         );
-        self.emulation.warp_cursor_in_layout(x, y, &layout).await?;
+        self.emulation.warp_cursor_in_layout(final_x, final_y, &layout).await?;
         Ok(EdgeWarpOutcome::Applied(layout))
     }
 
