@@ -3,10 +3,10 @@
 ## Run
 
 ```bash
-nix run github:jondkinney/mousehop
+nix run github:rusya13/mousehop
 
 # With params
-nix run github:jondkinney/mousehop -- --help
+nix run github:rusya13/mousehop -- --help
 
 ```
 
@@ -16,7 +16,7 @@ Add input:
 
 ```nix
 inputs = {
-    mousehop.url = "github:jondkinney/mousehop";
+    mousehop.url = "github:rusya13/mousehop";
 }
 ```
 

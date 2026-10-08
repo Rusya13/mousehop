@@ -3,7 +3,7 @@
   &nbsp;Mousehop
 </h1>
 
-[![CI](https://github.com/jondkinney/mousehop/actions/workflows/rust.yml/badge.svg)](https://github.com/jondkinney/mousehop/actions/workflows/rust.yml) [![Cachix](https://github.com/jondkinney/mousehop/actions/workflows/cachix.yml/badge.svg)](https://github.com/jondkinney/mousehop/actions/workflows/cachix.yml) [![Release](https://github.com/jondkinney/mousehop/actions/workflows/release.yml/badge.svg)](https://github.com/jondkinney/mousehop/actions/workflows/release.yml)
+[![CI](https://github.com/rusya13/mousehop/actions/workflows/rust.yml/badge.svg)](https://github.com/rusya13/mousehop/actions/workflows/rust.yml) [![Cachix](https://github.com/rusya13/mousehop/actions/workflows/cachix.yml/badge.svg)](https://github.com/rusya13/mousehop/actions/workflows/cachix.yml) [![Release](https://github.com/rusya13/mousehop/actions/workflows/release.yml/badge.svg)](https://github.com/rusya13/mousehop/actions/workflows/release.yml)
 
 [![license: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](./LICENSE)
 
@@ -135,7 +135,7 @@ Crashes are recorded either way, at
 
 First make sure to [install the necessary dependencies](#installing-dependencies-for-development--compiling-from-source).
 
-Precompiled release binaries for Windows, MacOS and Linux are available in the [releases section](https://github.com/jondkinney/mousehop/releases).
+Precompiled release binaries for Windows, MacOS and Linux are available in the [releases section](https://github.com/rusya13/mousehop/releases).
 For Windows, the depenedencies are included in the .zip file, for other operating systems see [Installing Dependencies](#installing-dependencies-for-development--compiling-from-source).
 
 Alternatively, the `mousehop` binary can be compiled from source (see below).
@@ -176,7 +176,7 @@ sudo cp target/release/mousehop /usr/local/bin/
 ### Compiling and installing via cargo:
 ```sh
 # will end up in ~/.cargo/bin
-cargo install --git https://github.com/jondkinney/mousehop
+cargo install --git https://github.com/rusya13/mousehop
 ```
 
 ### Compiling and installing via nix:
