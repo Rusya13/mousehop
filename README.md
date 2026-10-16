@@ -34,6 +34,19 @@ Focus lies on performance, ease of use and a maintainable implementation that ca
 </p>
 
 
+## Project facts
+
+- **What it is:** a desktop app (no server, no website) for people who use several computers and want one mouse and keyboard. Run it on each machine.
+- **Who owns it:** this repo is `rusya13/mousehop`, a GitHub fork of `jondkinney/mousehop`, which is itself a fork of `feschber/lan-mouse`. Upstream releases come from `jondkinney/mousehop`; the release links in this README still point there.
+- **Live URLs:** none. Releases are on GitHub Releases, the crates (`mousehop`, `mousehop-*`) on crates.io (latest 0.17.1), and the AUR packages `mousehop`, `mousehop-bin`, `mousehop-git`.
+- **Stack:** Rust 2021 workspace (8 crates), tokio, GTK4 and libadwaita, WebRTC DTLS (`webrtc-dtls`, rustls). Toolchain pinned in `rust-toolchain.toml` (1.95.0). Licence GPL-3.0-or-later.
+- **Run locally:** `cargo run` (see [Development](#development) for system libraries). Tests: `cargo test --workspace`. CI also runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`.
+- **How it deploys:** nothing is deployed. `release-plz.yml` opens a release PR; merging it publishes to crates.io and tags `vX.Y.Z`. The GitHub Release then triggers `release.yml` (Linux, Windows, macOS builds), `release-flatpak.yml` and `aur-publish.yml`. See [RELEASING.md](./RELEASING.md).
+- **Where it runs:** on users' machines only. No server, no container, no host in `servers.toml`.
+- **Connected services:** none at run time. CI uses GitHub secrets for crates.io, AUR, macOS signing and Cachix (names in RELEASING.md). No my-seo property, Plausible, ads or database.
+- **Backups:** no state to back up. The Git repo is the backup (and crates.io and GitHub Releases hold the published artefacts).
+- **More:** [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md), [docs/CHANGELOG-TECH.md](./docs/CHANGELOG-TECH.md), [docs/PROPOSALS.md](./docs/PROPOSALS.md), [docs/AUDIT-2026-10.md](./docs/AUDIT-2026-10.md).
+
 ## Encryption
 
 Mousehop encrypts all network traffic using the DTLS implementation provided by [WebRTC.rs](https://github.com/webrtc-rs/webrtc).
