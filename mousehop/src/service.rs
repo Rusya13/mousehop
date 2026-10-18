@@ -1501,7 +1501,7 @@ async fn recv_discovery(rx: &mut Receiver<DiscoveryEvent>) -> DiscoveryEvent {
 mod tests {
     #[test]
     fn short_fingerprint_handles_multibyte() {
-        assert_eq!(super::short_fingerprint("ééééééééé"), "éééééééé");
+        assert_eq!(super::short_fingerprint("aéééééééé"), "aééééééé");
         assert_eq!(super::short_fingerprint("abc"), "abc");
     }
 

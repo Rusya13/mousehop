@@ -321,6 +321,36 @@ pub enum ProtoEvent {
     OwnershipLost { serial: u32 },
 }
 
+fn fmt_hello(
+    f: &mut Formatter<'_>,
+    magic: &[u8; 8],
+    commit: &[u8; 8],
+    capabilities: u32,
+) -> std::fmt::Result {
+    let s = std::str::from_utf8(commit).unwrap_or("????????");
+    if *magic == PROTOCOL_MAGIC {
+        write!(f, "Hello({s}, capabilities=0x{capabilities:08x})")
+    } else {
+        write!(f, "Hello(foreign:{s}, capabilities=0x{capabilities:08x})")
+    }
+}
+
+fn fmt_clipboard(f: &mut Formatter<'_>, from_fingerprint: &str, content: &str) -> std::fmt::Result {
+    let head: String = content.chars().take(40).collect();
+    let preview = if head.len() < content.len() {
+        format!("{head}…")
+    } else {
+        head
+    };
+    write!(
+        f,
+        "Clipboard(from={}…, {}b: {preview})",
+        // Peer-supplied UTF-8: a byte slice could split a char.
+        from_fingerprint.chars().take(8).collect::<String>(),
+        content.len(),
+    )
+}
+
 impl Display for ProtoEvent {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -348,32 +378,11 @@ impl Display for ProtoEvent {
                 magic,
                 commit,
                 capabilities,
-            } => {
-                let s = std::str::from_utf8(commit).unwrap_or("????????");
-                if *magic == PROTOCOL_MAGIC {
-                    write!(f, "Hello({s}, capabilities=0x{capabilities:08x})")
-                } else {
-                    write!(f, "Hello(foreign:{s}, capabilities=0x{capabilities:08x})")
-                }
-            }
+            } => fmt_hello(f, magic, commit, *capabilities),
             ProtoEvent::Clipboard {
                 from_fingerprint,
                 content,
-            } => {
-                let head: String = content.chars().take(40).collect();
-                let preview = if head.len() < content.len() {
-                    format!("{head}…")
-                } else {
-                    head
-                };
-                write!(
-                    f,
-                    "Clipboard(from={}…, {}b: {preview})",
-                    // Peer-supplied UTF-8: a byte slice could split a char.
-                    from_fingerprint.chars().take(8).collect::<String>(),
-                    content.len(),
-                )
-            }
+            } => fmt_clipboard(f, from_fingerprint, content),
             ProtoEvent::HostInputState { state, generation } => {
                 write!(f, "HostInputState({state:?}, generation={generation})")
             }
