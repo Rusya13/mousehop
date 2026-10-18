@@ -154,30 +154,11 @@ impl MousehopListener {
         let (port_changed_tx, port_changed) = channel();
         let connection_attempts: Arc<Mutex<VecDeque<String>>> = Default::default();
 
-        let authorized = authorized_keys.clone();
         let verify_peer_certificate: Option<VerifyPeerCertificateFn> = {
             let connection_attempts = connection_attempts.clone();
             Some(Arc::new(
                 move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
-                    assert!(certs.len() == 1);
-                    let fingerprints = certs
-                        .iter()
-                        .map(|c| crypto::generate_fingerprint(c))
-                        .collect::<Vec<_>>();
-                    if authorized
-                        .read()
-                        .expect("lock")
-                        .contains_key(&fingerprints[0])
-                    {
-                        Ok(())
-                    } else {
-                        let fingerprint = fingerprints.into_iter().next().expect("fingerprint");
-                        connection_attempts
-                            .lock()
-                            .expect("lock")
-                            .push_back(fingerprint);
-                        Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
-                    }
+                    verify_peer_certificate(certs, &authorized_keys, &connection_attempts)
                 },
             ))
         };
@@ -407,6 +388,34 @@ fn listen_event_is_current(sessions: &ListenerSessions, event: &ListenEvent) -> 
         ListenEvent::Disconnected { addr, .. } => sessions.current.borrow().get(addr).is_none(),
         ListenEvent::Rejected { .. } => true,
     }
+}
+
+/// Accept only a single client certificate whose fingerprint is authorized.
+/// The certificate list comes from an unauthenticated peer, so it must not
+/// panic: release builds abort on panic, which would stop the whole service.
+fn verify_peer_certificate(
+    certs: &[Vec<u8>],
+    authorized_keys: &RwLock<HashMap<String, IncomingPeerConfig>>,
+    connection_attempts: &Mutex<VecDeque<String>>,
+) -> Result<(), webrtc_dtls::Error> {
+    let [cert] = certs else {
+        // Not `ErrVerifyDataMismatch`: the accept loop pairs that error
+        // with a queued fingerprint, and none is queued here.
+        return Err(webrtc_dtls::Error::ErrInvalidCertificate);
+    };
+    let fingerprint = crypto::generate_fingerprint(cert);
+    if authorized_keys
+        .read()
+        .expect("lock")
+        .contains_key(&fingerprint)
+    {
+        return Ok(());
+    }
+    connection_attempts
+        .lock()
+        .expect("lock")
+        .push_back(fingerprint);
+    Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
 }
 
 /// Whether an address is worth binding a DTLS listener to: a remote
@@ -945,6 +954,37 @@ mod tests {
 
     async fn test_conn() -> ArcConn {
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"))
+    }
+
+    #[test]
+    fn verify_peer_certificate_rejects_bad_chains_without_panicking() {
+        let cert = b"authorized cert".to_vec();
+        let authorized = RwLock::new(HashMap::from([(
+            crypto::generate_fingerprint(&cert),
+            IncomingPeerConfig::default(),
+        )]));
+        let attempts = Mutex::new(VecDeque::new());
+
+        assert!(
+            verify_peer_certificate(std::slice::from_ref(&cert), &authorized, &attempts).is_ok()
+        );
+        for certs in [vec![], vec![cert.clone(), b"extra".to_vec()]] {
+            assert!(matches!(
+                verify_peer_certificate(&certs, &authorized, &attempts),
+                Err(webrtc_dtls::Error::ErrInvalidCertificate)
+            ));
+        }
+        assert!(attempts.lock().unwrap().is_empty());
+
+        let stranger = b"unknown cert".to_vec();
+        assert!(matches!(
+            verify_peer_certificate(std::slice::from_ref(&stranger), &authorized, &attempts),
+            Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
+        ));
+        assert_eq!(
+            attempts.lock().unwrap().pop_front(),
+            Some(crypto::generate_fingerprint(&stranger))
+        );
     }
 
     #[tokio::test]
