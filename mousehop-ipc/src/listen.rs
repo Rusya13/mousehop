@@ -191,7 +191,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_request_body_is_not_executed() {
-        let dir = std::env::temp_dir().join(format!("mousehop-ipc-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mousehop-ipc-http-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut listener = AsyncFrontendListener::new_at(dir.join("http.sock"))
             .await
@@ -215,7 +215,7 @@ mod tests {
 
     #[tokio::test]
     async fn json_requests_are_accepted() {
-        let dir = std::env::temp_dir().join(format!("mousehop-ipc-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mousehop-ipc-json-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut listener = AsyncFrontendListener::new_at(dir.join("json.sock"))
             .await

@@ -154,81 +154,21 @@ impl MousehopListener {
         let (port_changed_tx, port_changed) = channel();
         let connection_attempts: Arc<Mutex<VecDeque<String>>> = Default::default();
 
-        let verify_peer_certificate: Option<VerifyPeerCertificateFn> = {
-            let connection_attempts = connection_attempts.clone();
-            Some(Arc::new(
-                move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
-                    verify_peer_certificate(certs, &authorized_keys, &connection_attempts)
-                },
-            ))
-        };
-        let cfg = Config {
-            certificates: vec![cert.clone()],
-            extended_master_secret: ExtendedMasterSecretType::Require,
-            client_auth: RequireAnyClientCert,
-            verify_peer_certificate,
-            ..Default::default()
-        };
+        let cfg = dtls_config(cert, authorized_keys, connection_attempts.clone());
 
         let conns: Rc<AsyncMutex<HashMap<SocketAddr, AcceptedConnection>>> =
             Rc::new(AsyncMutex::new(HashMap::new()));
         let sessions = ListenerSessions::default();
 
-        // Bind one listener per local address (v4 + v6, skipping
-        // loopback / link-local / multicast) instead of a single
-        // wildcard listener. With a single 0.0.0.0 / [::] bind on a
-        // multi-homed host, replies use the kernel's preferred
-        // outbound interface as source IP — which may not match the
-        // IP the peer dialed, breaking DTLS 4-tuple matching.
-        // Per-IP binds make replies symmetric automatically: each
-        // listener's reply socket is bound to a specific IP, so the
-        // kernel uses *that* IP as source.
-        let initial_addrs = enumerate_listenable_addrs();
-        if initial_addrs.is_empty() {
-            // Fall back to 0.0.0.0 so we at least listen somewhere if
-            // interface enumeration fails (very unusual).
-            log::warn!("no listenable IP addresses found; falling back to 0.0.0.0");
-        }
-        let mut listeners: HashMap<IpAddr, ListenerSlot> = HashMap::new();
-        let mut bound_count = 0usize;
-        for ip in &initial_addrs {
-            match try_bind_listener(*ip, port, &cfg).await {
-                Ok(listener) => {
-                    let task = spawn_accept_task(
-                        listener,
-                        listen_tx.clone(),
-                        conns.clone(),
-                        sessions.clone(),
-                        connection_attempts.clone(),
-                    );
-                    listeners.insert(*ip, ListenerSlot { accept_task: task });
-                    bound_count += 1;
-                    log::info!("listening for DTLS on {ip}:{port}");
-                }
-                Err(e) => log::warn!("failed to bind listener on {ip}:{port}: {e}"),
-            }
-        }
-        if bound_count == 0 {
-            // Either enumeration returned no addrs, or every bind
-            // failed. Try `0.0.0.0:port` as a last resort.
-            let fallback = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
-            match try_bind_listener(fallback, port, &cfg).await {
-                Ok(listener) => {
-                    let task = spawn_accept_task(
-                        listener,
-                        listen_tx.clone(),
-                        conns.clone(),
-                        sessions.clone(),
-                        connection_attempts.clone(),
-                    );
-                    listeners.insert(fallback, ListenerSlot { accept_task: task });
-                    log::info!(
-                        "listening for DTLS on {fallback}:{port} (fallback — symmetric replies not guaranteed)"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let listeners = bind_initial_listeners(
+            port,
+            &cfg,
+            &listen_tx,
+            &conns,
+            &sessions,
+            &connection_attempts,
+        )
+        .await?;
 
         // macOS wake → force-close-all-conns plumbing. On non-macOS
         // the receiver is `None` and the supervisor's wake arm stays
@@ -388,6 +328,92 @@ fn listen_event_is_current(sessions: &ListenerSessions, event: &ListenEvent) -> 
         ListenEvent::Disconnected { addr, .. } => sessions.current.borrow().get(addr).is_none(),
         ListenEvent::Rejected { .. } => true,
     }
+}
+
+/// Server DTLS config: require one client certificate and check it with
+/// [`verify_peer_certificate`].
+fn dtls_config(
+    cert: Certificate,
+    authorized_keys: Arc<RwLock<HashMap<String, IncomingPeerConfig>>>,
+    connection_attempts: Arc<Mutex<VecDeque<String>>>,
+) -> Config {
+    let verify: VerifyPeerCertificateFn = Arc::new(
+        move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
+            verify_peer_certificate(certs, &authorized_keys, &connection_attempts)
+        },
+    );
+    Config {
+        certificates: vec![cert],
+        extended_master_secret: ExtendedMasterSecretType::Require,
+        client_auth: RequireAnyClientCert,
+        verify_peer_certificate: Some(verify),
+        ..Default::default()
+    }
+}
+
+/// Bind one listener per local address (v4 + v6, skipping loopback /
+/// link-local / multicast) instead of a single wildcard listener, falling
+/// back to `0.0.0.0` when none can be bound. With a single 0.0.0.0 / [::]
+/// bind on a multi-homed host, replies use the kernel's preferred outbound
+/// interface as source IP — which may not match the IP the peer dialed,
+/// breaking DTLS 4-tuple matching. Per-IP binds make replies symmetric
+/// automatically: each listener's reply socket is bound to a specific IP,
+/// so the kernel uses *that* IP as source.
+async fn bind_initial_listeners(
+    port: u16,
+    cfg: &Config,
+    listen_tx: &Sender<ListenEvent>,
+    conns: &Rc<AsyncMutex<HashMap<SocketAddr, AcceptedConnection>>>,
+    sessions: &ListenerSessions,
+    connection_attempts: &Arc<Mutex<VecDeque<String>>>,
+) -> Result<HashMap<IpAddr, ListenerSlot>, ListenerCreationError> {
+    let initial_addrs = enumerate_listenable_addrs();
+    if initial_addrs.is_empty() {
+        // Fall back to 0.0.0.0 so we at least listen somewhere if
+        // interface enumeration fails (very unusual).
+        log::warn!("no listenable IP addresses found; falling back to 0.0.0.0");
+    }
+    let mut listeners: HashMap<IpAddr, ListenerSlot> = HashMap::new();
+    let mut bound_count = 0usize;
+    for ip in &initial_addrs {
+        match try_bind_listener(*ip, port, cfg).await {
+            Ok(listener) => {
+                let task = spawn_accept_task(
+                    listener,
+                    listen_tx.clone(),
+                    conns.clone(),
+                    sessions.clone(),
+                    connection_attempts.clone(),
+                );
+                listeners.insert(*ip, ListenerSlot { accept_task: task });
+                bound_count += 1;
+                log::info!("listening for DTLS on {ip}:{port}");
+            }
+            Err(e) => log::warn!("failed to bind listener on {ip}:{port}: {e}"),
+        }
+    }
+    if bound_count == 0 {
+        // Either enumeration returned no addrs, or every bind
+        // failed. Try `0.0.0.0:port` as a last resort.
+        let fallback = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        match try_bind_listener(fallback, port, cfg).await {
+            Ok(listener) => {
+                let task = spawn_accept_task(
+                    listener,
+                    listen_tx.clone(),
+                    conns.clone(),
+                    sessions.clone(),
+                    connection_attempts.clone(),
+                );
+                listeners.insert(fallback, ListenerSlot { accept_task: task });
+                log::info!(
+                    "listening for DTLS on {fallback}:{port} (fallback — symmetric replies not guaranteed)"
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(listeners)
 }
 
 /// Accept only a single client certificate whose fingerprint is authorized.
