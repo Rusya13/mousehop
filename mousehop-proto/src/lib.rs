@@ -369,7 +369,8 @@ impl Display for ProtoEvent {
                 write!(
                     f,
                     "Clipboard(from={}…, {}b: {preview})",
-                    &from_fingerprint[..from_fingerprint.len().min(8)],
+                    // Peer-supplied UTF-8: a byte slice could split a char.
+                    from_fingerprint.chars().take(8).collect::<String>(),
                     content.len(),
                 )
             }
@@ -1153,6 +1154,15 @@ pub fn decode_clipboard_event(buf: &[u8]) -> Result<ProtoEvent, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_display_handles_multibyte_fingerprint() {
+        let event = ProtoEvent::Clipboard {
+            from_fingerprint: "aéééééééé".into(),
+            content: "x".into(),
+        };
+        assert_eq!(event.to_string(), "Clipboard(from=aééééééé…, 1b: x)");
+    }
 
     #[test]
     fn clipboard_round_trip() {
