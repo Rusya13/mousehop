@@ -154,100 +154,21 @@ impl MousehopListener {
         let (port_changed_tx, port_changed) = channel();
         let connection_attempts: Arc<Mutex<VecDeque<String>>> = Default::default();
 
-        let authorized = authorized_keys.clone();
-        let verify_peer_certificate: Option<VerifyPeerCertificateFn> = {
-            let connection_attempts = connection_attempts.clone();
-            Some(Arc::new(
-                move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
-                    assert!(certs.len() == 1);
-                    let fingerprints = certs
-                        .iter()
-                        .map(|c| crypto::generate_fingerprint(c))
-                        .collect::<Vec<_>>();
-                    if authorized
-                        .read()
-                        .expect("lock")
-                        .contains_key(&fingerprints[0])
-                    {
-                        Ok(())
-                    } else {
-                        let fingerprint = fingerprints.into_iter().next().expect("fingerprint");
-                        connection_attempts
-                            .lock()
-                            .expect("lock")
-                            .push_back(fingerprint);
-                        Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
-                    }
-                },
-            ))
-        };
-        let cfg = Config {
-            certificates: vec![cert.clone()],
-            extended_master_secret: ExtendedMasterSecretType::Require,
-            client_auth: RequireAnyClientCert,
-            verify_peer_certificate,
-            ..Default::default()
-        };
+        let cfg = dtls_config(cert, authorized_keys, connection_attempts.clone());
 
         let conns: Rc<AsyncMutex<HashMap<SocketAddr, AcceptedConnection>>> =
             Rc::new(AsyncMutex::new(HashMap::new()));
         let sessions = ListenerSessions::default();
 
-        // Bind one listener per local address (v4 + v6, skipping
-        // loopback / link-local / multicast) instead of a single
-        // wildcard listener. With a single 0.0.0.0 / [::] bind on a
-        // multi-homed host, replies use the kernel's preferred
-        // outbound interface as source IP — which may not match the
-        // IP the peer dialed, breaking DTLS 4-tuple matching.
-        // Per-IP binds make replies symmetric automatically: each
-        // listener's reply socket is bound to a specific IP, so the
-        // kernel uses *that* IP as source.
-        let initial_addrs = enumerate_listenable_addrs();
-        if initial_addrs.is_empty() {
-            // Fall back to 0.0.0.0 so we at least listen somewhere if
-            // interface enumeration fails (very unusual).
-            log::warn!("no listenable IP addresses found; falling back to 0.0.0.0");
-        }
-        let mut listeners: HashMap<IpAddr, ListenerSlot> = HashMap::new();
-        let mut bound_count = 0usize;
-        for ip in &initial_addrs {
-            match try_bind_listener(*ip, port, &cfg).await {
-                Ok(listener) => {
-                    let task = spawn_accept_task(
-                        listener,
-                        listen_tx.clone(),
-                        conns.clone(),
-                        sessions.clone(),
-                        connection_attempts.clone(),
-                    );
-                    listeners.insert(*ip, ListenerSlot { accept_task: task });
-                    bound_count += 1;
-                    log::info!("listening for DTLS on {ip}:{port}");
-                }
-                Err(e) => log::warn!("failed to bind listener on {ip}:{port}: {e}"),
-            }
-        }
-        if bound_count == 0 {
-            // Either enumeration returned no addrs, or every bind
-            // failed. Try `0.0.0.0:port` as a last resort.
-            let fallback = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
-            match try_bind_listener(fallback, port, &cfg).await {
-                Ok(listener) => {
-                    let task = spawn_accept_task(
-                        listener,
-                        listen_tx.clone(),
-                        conns.clone(),
-                        sessions.clone(),
-                        connection_attempts.clone(),
-                    );
-                    listeners.insert(fallback, ListenerSlot { accept_task: task });
-                    log::info!(
-                        "listening for DTLS on {fallback}:{port} (fallback — symmetric replies not guaranteed)"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let listeners = bind_initial_listeners(
+            port,
+            &cfg,
+            &listen_tx,
+            &conns,
+            &sessions,
+            &connection_attempts,
+        )
+        .await?;
 
         // macOS wake → force-close-all-conns plumbing. On non-macOS
         // the receiver is `None` and the supervisor's wake arm stays
@@ -407,6 +328,120 @@ fn listen_event_is_current(sessions: &ListenerSessions, event: &ListenEvent) -> 
         ListenEvent::Disconnected { addr, .. } => sessions.current.borrow().get(addr).is_none(),
         ListenEvent::Rejected { .. } => true,
     }
+}
+
+/// Server DTLS config: require one client certificate and check it with
+/// [`verify_peer_certificate`].
+fn dtls_config(
+    cert: Certificate,
+    authorized_keys: Arc<RwLock<HashMap<String, IncomingPeerConfig>>>,
+    connection_attempts: Arc<Mutex<VecDeque<String>>>,
+) -> Config {
+    let verify: VerifyPeerCertificateFn = Arc::new(
+        move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
+            verify_peer_certificate(certs, &authorized_keys, &connection_attempts)
+        },
+    );
+    Config {
+        certificates: vec![cert],
+        extended_master_secret: ExtendedMasterSecretType::Require,
+        client_auth: RequireAnyClientCert,
+        verify_peer_certificate: Some(verify),
+        ..Default::default()
+    }
+}
+
+/// Bind one listener per local address (v4 + v6, skipping loopback /
+/// link-local / multicast) instead of a single wildcard listener, falling
+/// back to `0.0.0.0` when none can be bound. With a single 0.0.0.0 / [::]
+/// bind on a multi-homed host, replies use the kernel's preferred outbound
+/// interface as source IP — which may not match the IP the peer dialed,
+/// breaking DTLS 4-tuple matching. Per-IP binds make replies symmetric
+/// automatically: each listener's reply socket is bound to a specific IP,
+/// so the kernel uses *that* IP as source.
+async fn bind_initial_listeners(
+    port: u16,
+    cfg: &Config,
+    listen_tx: &Sender<ListenEvent>,
+    conns: &Rc<AsyncMutex<HashMap<SocketAddr, AcceptedConnection>>>,
+    sessions: &ListenerSessions,
+    connection_attempts: &Arc<Mutex<VecDeque<String>>>,
+) -> Result<HashMap<IpAddr, ListenerSlot>, ListenerCreationError> {
+    let initial_addrs = enumerate_listenable_addrs();
+    if initial_addrs.is_empty() {
+        // Fall back to 0.0.0.0 so we at least listen somewhere if
+        // interface enumeration fails (very unusual).
+        log::warn!("no listenable IP addresses found; falling back to 0.0.0.0");
+    }
+    let mut listeners: HashMap<IpAddr, ListenerSlot> = HashMap::new();
+    let mut bound_count = 0usize;
+    for ip in &initial_addrs {
+        match try_bind_listener(*ip, port, cfg).await {
+            Ok(listener) => {
+                let task = spawn_accept_task(
+                    listener,
+                    listen_tx.clone(),
+                    conns.clone(),
+                    sessions.clone(),
+                    connection_attempts.clone(),
+                );
+                listeners.insert(*ip, ListenerSlot { accept_task: task });
+                bound_count += 1;
+                log::info!("listening for DTLS on {ip}:{port}");
+            }
+            Err(e) => log::warn!("failed to bind listener on {ip}:{port}: {e}"),
+        }
+    }
+    if bound_count == 0 {
+        // Either enumeration returned no addrs, or every bind
+        // failed. Try `0.0.0.0:port` as a last resort.
+        let fallback = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        match try_bind_listener(fallback, port, cfg).await {
+            Ok(listener) => {
+                let task = spawn_accept_task(
+                    listener,
+                    listen_tx.clone(),
+                    conns.clone(),
+                    sessions.clone(),
+                    connection_attempts.clone(),
+                );
+                listeners.insert(fallback, ListenerSlot { accept_task: task });
+                log::info!(
+                    "listening for DTLS on {fallback}:{port} (fallback — symmetric replies not guaranteed)"
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(listeners)
+}
+
+/// Accept only a single client certificate whose fingerprint is authorized.
+/// The certificate list comes from an unauthenticated peer, so it must not
+/// panic: release builds abort on panic, which would stop the whole service.
+fn verify_peer_certificate(
+    certs: &[Vec<u8>],
+    authorized_keys: &RwLock<HashMap<String, IncomingPeerConfig>>,
+    connection_attempts: &Mutex<VecDeque<String>>,
+) -> Result<(), webrtc_dtls::Error> {
+    let [cert] = certs else {
+        // Not `ErrVerifyDataMismatch`: the accept loop pairs that error
+        // with a queued fingerprint, and none is queued here.
+        return Err(webrtc_dtls::Error::ErrInvalidCertificate);
+    };
+    let fingerprint = crypto::generate_fingerprint(cert);
+    if authorized_keys
+        .read()
+        .expect("lock")
+        .contains_key(&fingerprint)
+    {
+        return Ok(());
+    }
+    connection_attempts
+        .lock()
+        .expect("lock")
+        .push_back(fingerprint);
+    Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
 }
 
 /// Whether an address is worth binding a DTLS listener to: a remote
@@ -945,6 +980,37 @@ mod tests {
 
     async fn test_conn() -> ArcConn {
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"))
+    }
+
+    #[test]
+    fn verify_peer_certificate_rejects_bad_chains_without_panicking() {
+        let cert = b"authorized cert".to_vec();
+        let authorized = RwLock::new(HashMap::from([(
+            crypto::generate_fingerprint(&cert),
+            IncomingPeerConfig::default(),
+        )]));
+        let attempts = Mutex::new(VecDeque::new());
+
+        assert!(
+            verify_peer_certificate(std::slice::from_ref(&cert), &authorized, &attempts).is_ok()
+        );
+        for certs in [vec![], vec![cert.clone(), b"extra".to_vec()]] {
+            assert!(matches!(
+                verify_peer_certificate(&certs, &authorized, &attempts),
+                Err(webrtc_dtls::Error::ErrInvalidCertificate)
+            ));
+        }
+        assert!(attempts.lock().unwrap().is_empty());
+
+        let stranger = b"unknown cert".to_vec();
+        assert!(matches!(
+            verify_peer_certificate(std::slice::from_ref(&stranger), &authorized, &attempts),
+            Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
+        ));
+        assert_eq!(
+            attempts.lock().unwrap().pop_front(),
+            Some(crypto::generate_fingerprint(&stranger))
+        );
     }
 
     #[tokio::test]

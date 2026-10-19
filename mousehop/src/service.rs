@@ -155,6 +155,12 @@ const FASTEST_UPGRADE_STREAK: u8 = 3;
 
 const RECENT_FORWARD_TTL: Duration = Duration::from_secs(1);
 
+/// First 8 characters of a peer-supplied fingerprint for logging. The wire
+/// string is untrusted UTF-8, so byte-slicing could panic mid-character.
+fn short_fingerprint(fp: &str) -> &str {
+    fp.char_indices().nth(8).map_or(fp, |(i, _)| &fp[..i])
+}
+
 fn clipboard_hash(content: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     content.hash(&mut hasher);
@@ -946,7 +952,7 @@ impl Service {
         if self.recent_forwarded.contains_key(&key) {
             log::debug!(
                 "skipping clipboard re-fan-out: already forwarded ({}, {} bytes) within {}ms",
-                &from_fingerprint[..from_fingerprint.len().min(8)],
+                short_fingerprint(&from_fingerprint),
                 content.len(),
                 RECENT_FORWARD_TTL.as_millis()
             );
@@ -974,7 +980,7 @@ impl Service {
         log::info!(
             "forwarding clipboard ({} bytes, originator {}) to {} peer(s)",
             content.len(),
-            &from_fingerprint[..from_fingerprint.len().min(8)],
+            short_fingerprint(&from_fingerprint),
             forward_targets.len()
         );
         for handle in forward_targets {
@@ -1493,6 +1499,12 @@ async fn recv_discovery(rx: &mut Receiver<DiscoveryEvent>) -> DiscoveryEvent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn short_fingerprint_handles_multibyte() {
+        assert_eq!(super::short_fingerprint("aéééééééé"), "aééééééé");
+        assert_eq!(super::short_fingerprint("abc"), "abc");
+    }
+
     use super::*;
 
     #[test]
